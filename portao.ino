@@ -1,110 +1,159 @@
-#include <Servo.h>
 #include <SPI.h>
 #include <MFRC522.h>
+#include <esp_now.h>
+#include <WiFi.h>
 
-#define SERVO 6
-#define MAX 180
-#define MIN 0
-#define ledPin 3
-#define TEMPO_ABERTO 500
+uint8_t peerAddress[] = {0x10, 0x52, 0x1C, 0x5E, 0x09, 0xEC};
 
-String strID;
-String cadastrados[1]={
-  "73:95:52:4d",
-};
-bool fechado = false, aberto = false, fim_de_curso = false, acionado = false;
-byte i, pos = 0x00;
-int contador = 0;
-MFRC522 rfid(10, 9);
-Servo servo1;
+typedef struct struct_message {
+  bool acionamento;
+} struct_message;
 
-void setup(){
+struct_message msg;
 
-  TCCR1A = 0x00;
-  TCCR1B = 0x03;
-  TCNT1 = 0xF63C;
+esp_now_peer_info_t peerInfo;
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+}
+
+uint8_t leitura_cartao[4];
+uint8_t cadastrados[20][4];
+uint8_t cont_cadastros = 0;
+
+MFRC522 rfid(14, 13);  // sda_pin , rs_pin
+bool modo_gravar = false, modo_apagar = false;
+
+void IRAM_ATTR botao_gravar() {
+  Serial.println("Entrando modo gravar");
+  if (!modo_apagar) modo_gravar = true;
+}
+
+void IRAM_ATTR botao_apagar() {
+  Serial.println("Entrando modo apagar");
+  if (!modo_gravar) modo_apagar = true;
+}
+
+void setup() {
+
+  pinMode(12, INPUT_PULLUP);
+  pinMode(27, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(12), botao_gravar, FALLING);
+  attachInterrupt(digitalPinToInterrupt(27), botao_apagar, FALLING);
+
+  pinMode(16, OUTPUT);
+  pinMode(5, OUTPUT);
+  pinMode(26, OUTPUT);
+  digitalWrite(16, LOW);
+  digitalWrite(5, LOW);
+  digitalWrite(26, LOW);
   
-  // 100Hz 10ms -> Ps 64 -> Inicializar TCNT1 com 63036 ou 0xF63C
-  // 40Hz 25ms  -> Ps 64 -> Inicializar TCNT1 com 59286 ou 0xE796
-  // 20Hz 50ms -> Ps 256 -> Inicializar TCNT1 com 62411 ou 0xF3CB
-  // 10Hz 100ms -> Ps 64 -> Inicializar TCNT1 com 40536 ou 0x9E58
+  msg.acionamento = true;
 
-  servo1.attach(SERVO);
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+
+  memcpy(peerInfo.peer_addr, peerAddress, 6);
+  peerInfo.channel = 1;  
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    return;
+  }
+
   Serial.begin(9600);
   SPI.begin();
-  rfid.PCD_Init();
+  rfid.PCD_Init();  
 }
 
-void loop(){
+void loop() {
 
-  if(!acionado)
-    if(getID())
-      if(validar()){
-        acionado = true;
-        //TIMSK1 |= (1 << TOIE1);
-      }     
-      else
-        invalido();
-
+  if (!modo_gravar && !modo_apagar) {
+    if (getID())
+      if (validar() != 100) {
+        esp_err_t result = esp_now_send(peerAddress, (uint8_t *) &msg, sizeof(msg));
+        delay(200);
+      } else
+        erro();
+    } else
+      modificar_registro();
+      
+  delay(100);  
 }
 
-void invalido(){
-  //sinaliza erro, sonoro
+void modificar_registro() {
+  uint8_t cartao;
+
+  if (modo_gravar) {
+    digitalWrite(5, HIGH);
+    while (!getID()) {};
+    delay(500);
+    cartao = validar();
+    digitalWrite(5, LOW);
+    if (cartao == 100) {
+      for (uint8_t i = 0; i < 4; i++) cadastrados[cont_cadastros][i] = leitura_cartao[i];
+      cont_cadastros++;
+      validado();
+    } else {
+      erro();
+    }    
+    modo_gravar = false;
+
+  } else {  // modo_apagar
+    digitalWrite(16, HIGH);
+    while (!getID()) {};
+    delay(500);
+    cartao = validar();
+    digitalWrite(16, LOW);
+    if (cartao != 100) {
+      cont_cadastros--;
+      for (uint8_t i = 0; i < 4; i++) cadastrados[cartao][i] = cadastrados[cont_cadastros][i];
+      validado();
+    } else {
+      erro();
+    }    
+    modo_apagar = false;
+  }
   return;
 }
 
-bool validar(){
-  for(i=0; i<1; i++)
-    if(strID.indexOf(cadastrados[i]) >= 0) return true;
-  return false;
+void erro() {
+  digitalWrite(26, HIGH);
+  for (uint8_t i = 0; i < 10; i++){
+    digitalWrite(16, digitalRead(16)^1);
+    delay(70);
+  }
+  digitalWrite(26, LOW);
+  return;
 }
 
-bool getID(){
-  if(!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return false;
-  strID = "";
-  for(i=0; i < 4; i++)
-    strID += (rfid.uid.uidByte[i] < 0x10 ? "0" : "") + String(rfid.uid.uidByte[i], HEX) + (i!=3 ? ":" : "");
-  rfid.PICC_HaltA();~
-  Serial.println(strID);
+void validado() {
+  digitalWrite(26, HIGH);
+  for (uint8_t i = 0; i < 10; i++){
+      digitalWrite(5, digitalRead(5)^1);
+      delay(70);
+  }
+  digitalWrite(26, LOW);
+  return;  
+}
+
+uint8_t validar() {
+  for (uint8_t i = 0; i < cont_cadastros; i++){
+    if (cadastrados[i][0] == leitura_cartao[0] && cadastrados[i][1] == leitura_cartao[1] && cadastrados[i][2] == leitura_cartao[2] && cadastrados[i][3] == leitura_cartao[3]) return i;
+  }
+  return 100;
+}
+
+bool getID() {
+  for (uint8_t i = 0; i < 4; i++) leitura_cartao[i] = 0;
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return false;
+  for (uint8_t i = 0; i < 4; i++) {
+    leitura_cartao[i] = rfid.uid.uidByte[i];
+  }
+  rfid.PICC_HaltA();
   return true;
 }
-
-ISR(TIMER1_OVF_vect){
-  TCNT1 = 0xF63C;
-
-  if(fechado){
-    if(pos < MAX){
-      servo1.write(pos);
-      pos++;
-    }
-    else{
-      fim_de_curso = true;
-      fechado = false;
-    }
-  }
-
-  if(fim_de_curso){
-      if(contador < TEMPO_ABERTO){
-        contador++;
-      }
-      else{
-        fim_de_curso = false;
-        aberto = true;
-      }
-    }
-
-  if(aberto){
-      if(pos > MIN){
-        servo1.write(pos);
-        pos--;
-      }
-      else{
-        fechado = true;        
-        acionado = false;
-        TIMSK1 &= (0 << TOIE1);
-      }
-    }
-}
-
-
-//digitalWrite(ledPin, digitalRead(ledPin)^1);
